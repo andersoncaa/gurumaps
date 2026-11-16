@@ -74,29 +74,53 @@ def fetch_stations(states):
     return out
 
 
+def _latest_from(data, latest, overwrite):
+    for st in data:
+        trip = st.get("stationTriplet")
+        for d in st.get("data", []):
+            code = d.get("stationElement", {}).get("elementCode")
+            vals = [v for v in d.get("values", []) if v.get("value") is not None]
+            if not (code and vals):
+                continue
+            v = vals[-1]
+            slot = latest.setdefault(trip, {})
+            if overwrite or code not in slot:
+                slot[code] = (v.get("date"), v["value"])
+
+
 def fetch_latest(triplets, days=5):
-    """Return {triplet: {"SNWD": (date, value), "WTEQ": (date, value)}}."""
-    end = date.today()
-    begin = end - timedelta(days=days)
+    """Return {triplet: {"SNWD": (stamp, value), "WTEQ": (stamp, value)}}.
+
+    Daily values are fetched first as a baseline. Then hourly values are
+    fetched and, where a station has them, replace the daily value so the
+    map shows the most recent reading (not just last midnight's).
+    """
+    today = date.today()
     latest = {}
     triplets = list(triplets)
     for i in range(0, len(triplets), 50):
-        chunk = triplets[i:i + 50]
+        chunk = ",".join(triplets[i:i + 50])
+        # 1) daily baseline
         data = get_json("data", {
-            "stationTriplets": ",".join(chunk),
+            "stationTriplets": chunk,
             "elements": "SNWD,WTEQ",
             "duration": "DAILY",
-            "beginDate": begin.isoformat(),
-            "endDate": end.isoformat(),
+            "beginDate": (today - timedelta(days=days)).isoformat(),
+            "endDate": today.isoformat(),
         })
-        for st in data:
-            trip = st.get("stationTriplet")
-            for d in st.get("data", []):
-                code = d.get("stationElement", {}).get("elementCode")
-                vals = [v for v in d.get("values", []) if v.get("value") is not None]
-                if code and vals:
-                    v = vals[-1]
-                    latest.setdefault(trip, {})[code] = (v.get("date"), v["value"])
+        _latest_from(data, latest, overwrite=False)
+        # 2) hourly overrides (best effort; daily stays if this fails)
+        try:
+            hourly = get_json("data", {
+                "stationTriplets": chunk,
+                "elements": "SNWD,WTEQ",
+                "duration": "HOURLY",
+                "beginDate": f"{(today - timedelta(days=1)).isoformat()} 00:00",
+                "endDate": f"{(today + timedelta(days=1)).isoformat()} 00:00",
+            })
+            _latest_from(hourly, latest, overwrite=True)
+        except RuntimeError as e:
+            print(f"Hourly fetch failed, using daily only: {e}", file=sys.stderr)
     return latest
 
 
