@@ -45,17 +45,22 @@ STYLE = """node {
 """
 
 
-def get_json(path, params, retries=3):
+def get_json(path, params, retries=5):
     url = f"{API}/{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "snotel-guru-maps/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "snotel-guru-maps/1.1"})
     last = None
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=45) as r:
                 return json.load(r)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             last = e
-            time.sleep(2 * (attempt + 1))
+            wait = 5 * (2 ** attempt)  # 5, 10, 20, 40, 80 s
+            print(f"  attempt {attempt + 1}/{retries} failed ({e}); "
+                  f"{'retrying in ' + str(wait) + 's' if attempt < retries - 1 else 'giving up'}",
+                  file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(wait)
     raise RuntimeError(f"AWDB request failed: {url}\n{last}")
 
 
@@ -89,27 +94,32 @@ def _latest_from(data, latest, overwrite):
 
 
 def fetch_latest(triplets, days=5):
-    """Return {triplet: {"SNWD": (stamp, value), "WTEQ": (stamp, value)}}.
+    """Return ({triplet: {"SNWD": (stamp, value), "WTEQ": (stamp, value)}}, failed).
 
-    Daily values are fetched first as a baseline. Then hourly values are
-    fetched and, where a station has them, replace the daily value so the
-    map shows the most recent reading (not just last midnight's).
+    Daily values are fetched first as a baseline, then hourly values replace
+    them where available so the map shows the most recent reading. A chunk
+    that fails does not abort the run: its stations are returned in `failed`
+    so the caller can keep their previous values.
     """
     today = date.today()
-    latest = {}
+    latest, failed = {}, set()
     triplets = list(triplets)
-    for i in range(0, len(triplets), 50):
-        chunk = ",".join(triplets[i:i + 50])
-        # 1) daily baseline
-        data = get_json("data", {
-            "stationTriplets": chunk,
-            "elements": "SNWD,WTEQ",
-            "duration": "DAILY",
-            "beginDate": (today - timedelta(days=days)).isoformat(),
-            "endDate": today.isoformat(),
-        })
-        _latest_from(data, latest, overwrite=False)
-        # 2) hourly overrides (best effort; daily stays if this fails)
+    for i in range(0, len(triplets), 25):
+        group = triplets[i:i + 25]
+        chunk = ",".join(group)
+        got_any = False
+        try:
+            data = get_json("data", {
+                "stationTriplets": chunk,
+                "elements": "SNWD,WTEQ",
+                "duration": "DAILY",
+                "beginDate": (today - timedelta(days=days)).isoformat(),
+                "endDate": today.isoformat(),
+            })
+            _latest_from(data, latest, overwrite=False)
+            got_any = True
+        except RuntimeError as e:
+            print(f"Daily fetch failed for a chunk: {e}", file=sys.stderr)
         try:
             hourly = get_json("data", {
                 "stationTriplets": chunk,
@@ -119,9 +129,12 @@ def fetch_latest(triplets, days=5):
                 "endDate": f"{(today + timedelta(days=1)).isoformat()} 00:00",
             })
             _latest_from(hourly, latest, overwrite=True)
+            got_any = True
         except RuntimeError as e:
-            print(f"Hourly fetch failed, using daily only: {e}", file=sys.stderr)
-    return latest
+            print(f"Hourly fetch failed for a chunk: {e}", file=sys.stderr)
+        if not got_any:
+            failed.update(group)
+    return latest, failed
 
 
 def fmt(v):
@@ -149,6 +162,7 @@ def build_geojson(stations, latest):
             "name": f"SNOTEL: {s.get('name', trip)}",
             "label": label,
             "details": "\n".join(lines),
+            "station": trip,
         }
         if depth != "":
             props["depth_in"] = depth
@@ -181,6 +195,15 @@ def write_embedded_ms(path, gj):
         f.write(ms)
 
 
+def load_previous(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            gj = json.load(f)
+        return {ft["properties"].get("station"): ft for ft in gj.get("features", [])}
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--states", default="UT", help="comma-separated state codes (default UT)")
@@ -192,14 +215,27 @@ def main():
     stations = fetch_stations(states)
     if not stations:
         sys.exit("No stations returned; not overwriting output.")
-    latest = fetch_latest(stations.keys())
+    latest, failed = fetch_latest(stations.keys())
     gj = build_geojson(stations, latest)
-    with_depth = sum(1 for f in gj["features"] if "depth_in" in f["properties"])
-    if with_depth == 0:
-        sys.exit("No depth readings returned; not overwriting output.")
+
+    if failed:
+        prev = load_previous(a.out)
+        kept = 0
+        for i, ft in enumerate(gj["features"]):
+            trip = ft["properties"].get("station")
+            if trip in failed and trip in prev:
+                gj["features"][i] = prev[trip]
+                kept += 1
+        print(f"{len(failed)} stations could not be refreshed; kept previous values for {kept}.",
+              file=sys.stderr)
+
+    fresh = sum(1 for f in gj["features"]
+                if "depth_in" in f["properties"] and f["properties"].get("station") not in failed)
+    if fresh == 0:
+        sys.exit("No fresh depth readings returned; not overwriting output.")
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(gj, f, separators=(",", ":"))
-    print(f"Wrote {a.out}: {len(gj['features'])} stations, {with_depth} with depth", file=sys.stderr)
+    print(f"Wrote {a.out}: {len(gj['features'])} stations, {fresh} freshly updated", file=sys.stderr)
     if a.ms_embedded:
         write_embedded_ms(a.ms_embedded, gj)
         print(f"Wrote {a.ms_embedded}", file=sys.stderr)
